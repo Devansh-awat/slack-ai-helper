@@ -35,10 +35,23 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
   let threadText = "";
   if (thread_ts) {
     try {
-      const replies = await slackClient.conversations.replies({
-        channel: channel_id,
-        ts: thread_ts,
-      });
+      let replies;
+      try {
+        replies = await slackClient.conversations.replies({
+          channel: channel_id,
+          ts: thread_ts,
+        });
+      } catch (replyErr) {
+        if (replyErr.code === "slack_webapi_platform_error" && replyErr.data.error === "not_in_channel") {
+          await slackClient.conversations.join({ channel: channel_id });
+          replies = await slackClient.conversations.replies({
+            channel: channel_id,
+            ts: thread_ts,
+          });
+        } else {
+          throw replyErr;
+        }
+      }
       threadText = replies.messages
         .map((m) => {
           const sender = m.user ? `<@${m.user}>` : `Bot (${m.username || m.bot_id})`;
@@ -267,9 +280,22 @@ ${threadText || "(Not run in a thread)"}`;
 
             let searchResults = [];
             try {
-              const res = await slackClient.bookmarks.list({
-                channel: args.channel_id,
-              });
+              let res;
+              try {
+                res = await slackClient.bookmarks.list({
+                  channel: args.channel_id,
+                });
+              } catch (bookmarkErr) {
+                if (bookmarkErr.code === "slack_webapi_platform_error" && bookmarkErr.data.error === "not_in_channel") {
+                  await slackClient.conversations.join({ channel: args.channel_id });
+                  res = await slackClient.bookmarks.list({
+                    channel: args.channel_id,
+                  });
+                } else {
+                  throw bookmarkErr;
+                }
+              }
+
               if (res.ok && res.bookmarks) {
                 searchResults = res.bookmarks.map((b) => ({
                   id: b.id,
