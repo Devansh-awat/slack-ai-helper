@@ -53,14 +53,13 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
 
   const systemPrompt = `You are a Slack AI assistant helping developers in a workspace thread.
 You have access to the following tools:
-1. search_channel_history: Search the last 100 messages in the current Slack channel to find previous messages, context, or what developers said. Use this when asked about previous discussions or context in the current channel.
-2. search_slack_workspace: Search all public channels and messages in the entire Slack workspace. Use this when asked to search Slack generally, look up past messages in other channels, or find discussions outside the current channel.
-3. list_channels: List all public channels in the Slack workspace to find channel names and IDs. Useful to find channels like #welcome, #faq, etc.
-4. list_channel_bookmarks: List all bookmarks/tabs at the top of a specific Slack channel by its ID. Use this to find FAQ links, spreadsheets, or documents pinned as tabs.
-5. read_web_page: Fetch the content of a public URL. Use this to read the content of bookmarks or links you find.
+1. search_channel_history: Search the last 100 messages in a specific Slack channel (or the current channel if channel_id is not specified). Use this to find previous messages, context, or what developers said.
+2. list_channels: List all public channels in the Slack workspace to find channel names and IDs. Useful to find channels like #welcome, #faq, etc.
+3. list_channel_bookmarks: List all bookmarks/tabs at the top of a specific Slack channel by its ID. Use this to find FAQ links, spreadsheets, or documents pinned as tabs.
+4. read_web_page: Fetch the content of a public URL. Use this to read the content of bookmarks or links you find.
 
 Citing sources:
-- If you find information from Slack messages, cite the sender (using their <@USER_ID> if available) and provide the message permalink URL as the source.
+- If you find information from Slack messages, cite the sender (using their <@USER_ID> if available) and reference the channel they said it in.
 - If you find information from bookmarks, docs, or web links, cite the bookmark title and provide the URL.
 
 If the thread history does not have enough information to answer, use the appropriate search/list tools to locate the answer.
@@ -85,7 +84,7 @@ ${threadText || "(Not run in a thread)"}`;
       type: "function",
       function: {
         name: "search_channel_history",
-        description: "Search the recent messages in the current Slack channel for matching context or previous messages.",
+        description: "Search the recent messages in a specific Slack channel (or the current channel if channel_id is not provided).",
         parameters: {
           type: "object",
           properties: {
@@ -93,22 +92,9 @@ ${threadText || "(Not run in a thread)"}`;
               type: "string",
               description: "The term or phrase to search for in the recent message history.",
             },
-          },
-          required: ["query"],
-        },
-      },
-    },
-    {
-      type: "function",
-      function: {
-        name: "search_slack_workspace",
-        description: "Search all public channels and messages in the entire Slack workspace for context, discussions, or answers.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
+            channel_id: {
               type: "string",
-              description: "The search query term or phrase.",
+              description: "The ID of the channel to search (e.g. C12345). If omitted, searches the current channel.",
             },
           },
           required: ["query"],
@@ -202,12 +188,28 @@ ${threadText || "(Not run in a thread)"}`;
               args = { query: toolCall.function.arguments };
             }
 
+            const targetChannel = args.channel_id || channel_id;
             let searchResults = [];
             try {
-              const history = await slackClient.conversations.history({
-                channel: channel_id,
-                limit: 100,
-              });
+              let history;
+              try {
+                history = await slackClient.conversations.history({
+                  channel: targetChannel,
+                  limit: 100,
+                });
+              } catch (historyErr) {
+                // If bot is not in the public channel, try joining it
+                if (historyErr.code === "slack_webapi_platform_error" && historyErr.data.error === "not_in_channel") {
+                  await slackClient.conversations.join({ channel: targetChannel });
+                  history = await slackClient.conversations.history({
+                    channel: targetChannel,
+                    limit: 100,
+                  });
+                } else {
+                  throw historyErr;
+                }
+              }
+
               searchResults = history.messages
                 .filter((m) => m.text && m.text.toLowerCase().includes(args.query.toLowerCase()))
                 .map((m) => ({
@@ -216,7 +218,8 @@ ${threadText || "(Not run in a thread)"}`;
                   ts: m.ts,
                 }));
             } catch (err) {
-              console.error("Failed to search channel history:", err);
+              console.error(`Failed to search channel history for ${targetChannel}:`, err);
+              searchResults = { error: `Failed to search channel history: ${err.message}` };
             }
 
             messages.push({
@@ -225,41 +228,98 @@ ${threadText || "(Not run in a thread)"}`;
               name: "search_channel_history",
               content: JSON.stringify(searchResults),
             });
-          } else if (toolCall.function.name === "search_slack_workspace") {
+          } else if (toolCall.function.name === "list_channels") {
+            let searchResults = [];
+            try {
+              const res = await slackClient.conversations.list({
+                exclude_archived: true,
+                types: "public_channel",
+                limit: 100,
+              });
+              if (res.ok && res.channels) {
+                searchResults = res.channels.map((c) => ({
+                  id: c.id,
+                  name: c.name,
+                  purpose: c.purpose ? c.purpose.value : "",
+                  topic: c.topic ? c.topic.value : "",
+                }));
+              }
+            } catch (err) {
+              console.error("Failed to list channels:", err);
+              searchResults = { error: `Failed to list channels: ${err.message}` };
+            }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              name: "list_channels",
+              content: JSON.stringify(searchResults),
+            });
+          } else if (toolCall.function.name === "list_channel_bookmarks") {
             let args;
             try {
               args = JSON.parse(toolCall.function.arguments);
             } catch (err) {
-              args = { query: toolCall.function.arguments };
+              args = { channel_id: toolCall.function.arguments };
             }
 
             let searchResults = [];
             try {
-              const res = await slackClient.search.messages({
-                query: args.query,
-                count: 10,
+              const res = await slackClient.bookmarks.list({
+                channel: args.channel_id,
               });
-              if (res.ok && res.messages && res.messages.matches) {
-                searchResults = res.messages.matches.map((m) => ({
-                  channel: m.channel ? `#${m.channel.name}` : "Unknown",
-                  user: m.username || m.user || "Unknown",
-                  text: m.text,
-                  permalink: m.permalink,
-                  ts: m.ts,
+              if (res.ok && res.bookmarks) {
+                searchResults = res.bookmarks.map((b) => ({
+                  id: b.id,
+                  title: b.title,
+                  link: b.link,
+                  type: b.type,
                 }));
               }
             } catch (err) {
-              console.error("Failed to search Slack workspace:", err);
+              console.error("Failed to list channel bookmarks:", err);
               searchResults = {
-                error: `Failed to search Slack workspace: ${err.message}. If this is a missing scope error, make sure the Slack App has the 'search:read' scope enabled in the developer dashboard and the app is reinstalled.`,
+                error: `Failed to list bookmarks: ${err.message}. If this is a missing scope error, make sure the Slack App has 'bookmarks:read' scope enabled in the developer dashboard.`,
               };
             }
 
             messages.push({
               role: "tool",
               tool_call_id: toolCall.id,
-              name: "search_slack_workspace",
+              name: "list_channel_bookmarks",
               content: JSON.stringify(searchResults),
+            });
+          } else if (toolCall.function.name === "read_web_page") {
+            let args;
+            try {
+              args = JSON.parse(toolCall.function.arguments);
+            } catch (err) {
+              args = { url: toolCall.function.arguments };
+            }
+
+            let pageText = "";
+            try {
+              const res = await fetch(args.url);
+              if (res.ok) {
+                const html = await res.text();
+                pageText = html
+                  .replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, "")
+                  .replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, "")
+                  .replace(/<[^>]+>/g, " ")
+                  .replace(/\s+/g, " ")
+                  .substring(0, 10000);
+              } else {
+                pageText = `Error fetching page: Status ${res.status}`;
+              }
+            } catch (err) {
+              pageText = `Error reading web page: ${err.message}`;
+            }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              name: "read_web_page",
+              content: JSON.stringify({ content: pageText }),
             });
           }
         }
