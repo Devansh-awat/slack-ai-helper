@@ -103,6 +103,7 @@ app.command("/ai-ping", async ({ command, ack, respond }) => {
 
 app.command("/ai-help", async ({ command, ack, respond, client: slackClient }) => {
   await ack();
+  console.log("AI-HELP payload:", JSON.stringify(command, null, 2));
 
   if (!client) {
     await respond({ text: "Bot is still starting up, please try again in a moment." });
