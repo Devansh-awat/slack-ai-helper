@@ -136,13 +136,14 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
   }
 
   const systemPrompt = `You are a Slack AI assistant helping developers in a workspace thread.
-You have access to two tools:
-1. search_workspace: Search the local codebase files for files/code.
-2. search_channel_history: Search the last 100 messages in the current Slack channel to find previous messages, context, or what developers said. Use this when asked about previous discussions or context in the channel.
+You have access to three tools:
+1. search_codebase: Search the local codebase directory files for code/documentation.
+2. search_channel_history: Search the last 100 messages in the current Slack channel to find previous messages, context, or what developers said. Use this when asked about previous discussions or context in the current channel.
+3. search_slack_workspace: Search all public channels and messages in the entire Slack workspace. Use this when asked to search Slack generally, look up past messages in other channels, or find discussions outside the current channel.
 
 Citing sources:
-- If you find information from local workspace files, cite the relative file path.
-- If you find information from previous channel messages, cite the sender (using their <@USER_ID> if available) and reference what they said.
+- If you find information from local codebase files, cite the relative file path.
+- If you find information from Slack messages, cite the sender (using their <@USER_ID> if available) and provide the message permalink URL as the source.
 
 If the thread history does not have enough information to answer, use the appropriate search tool.
 If you are still not confident in your answer or cannot find the answer, you MUST say so clearly and NOT hallucinate an answer.
@@ -165,8 +166,8 @@ ${threadText || "(Not run in a thread)"}`;
     {
       type: "function",
       function: {
-        name: "search_workspace",
-        description: "Search the local workspace codebase files for code, configuration, or documentation matching the query.",
+        name: "search_codebase",
+        description: "Search the local codebase directory files for code, configuration, or documentation matching the query.",
         parameters: {
           type: "object",
           properties: {
@@ -190,6 +191,23 @@ ${threadText || "(Not run in a thread)"}`;
             query: {
               type: "string",
               description: "The term or phrase to search for in the recent message history.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "search_slack_workspace",
+        description: "Search all public channels and messages in the entire Slack workspace for context, discussions, or answers.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query term or phrase.",
             },
           },
           required: ["query"],
@@ -230,7 +248,7 @@ ${threadText || "(Not run in a thread)"}`;
         messages.push(message);
 
         for (const toolCall of message.tool_calls) {
-          if (toolCall.function.name === "search_workspace") {
+          if (toolCall.function.name === "search_codebase" || toolCall.function.name === "search_workspace") {
             let args;
             try {
               args = JSON.parse(toolCall.function.arguments);
@@ -242,7 +260,7 @@ ${threadText || "(Not run in a thread)"}`;
             messages.push({
               role: "tool",
               tool_call_id: toolCall.id,
-              name: "search_workspace",
+              name: toolCall.function.name,
               content: JSON.stringify(searchResults),
             });
           } else if (toolCall.function.name === "search_channel_history") {
@@ -274,6 +292,42 @@ ${threadText || "(Not run in a thread)"}`;
               role: "tool",
               tool_call_id: toolCall.id,
               name: "search_channel_history",
+              content: JSON.stringify(searchResults),
+            });
+          } else if (toolCall.function.name === "search_slack_workspace") {
+            let args;
+            try {
+              args = JSON.parse(toolCall.function.arguments);
+            } catch (err) {
+              args = { query: toolCall.function.arguments };
+            }
+
+            let searchResults = [];
+            try {
+              const res = await slackClient.search.messages({
+                query: args.query,
+                count: 10,
+              });
+              if (res.ok && res.messages && res.messages.matches) {
+                searchResults = res.messages.matches.map((m) => ({
+                  channel: m.channel ? `#${m.channel.name}` : "Unknown",
+                  user: m.username || m.user || "Unknown",
+                  text: m.text,
+                  permalink: m.permalink,
+                  ts: m.ts,
+                }));
+              }
+            } catch (err) {
+              console.error("Failed to search Slack workspace:", err);
+              searchResults = {
+                error: `Failed to search Slack workspace: ${err.message}. If this is a missing scope error, make sure the Slack App has the 'search:read' scope enabled in the developer dashboard and the app is reinstalled.`,
+              };
+            }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              name: "search_slack_workspace",
               content: JSON.stringify(searchResults),
             });
           }
