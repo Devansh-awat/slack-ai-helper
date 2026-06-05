@@ -101,21 +101,20 @@ app.command("/ai-ping", async ({ command, ack, respond }) => {
   await respond({ text: `Pong!\nLatency: ${latency}ms` });
 });
 
-app.command("/ai-help", async ({ command, ack, respond, client: slackClient }) => {
-  await ack();
-  console.log("AI-HELP payload:", JSON.stringify(command, null, 2));
-
+async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond }) {
   if (!client) {
-    await respond({ text: "Bot is still starting up, please try again in a moment." });
+    const errorText = "Bot is still starting up, please try again in a moment.";
+    if (respond) await respond({ text: errorText });
+    else await slackClient.chat.postMessage({ channel: channel_id, thread_ts, text: errorText });
     return;
   }
 
   let threadText = "";
-  if (command.thread_ts) {
+  if (thread_ts) {
     try {
       const replies = await slackClient.conversations.replies({
-        channel: command.channel_id,
-        ts: command.thread_ts,
+        channel: channel_id,
+        ts: thread_ts,
       });
       threadText = replies.messages
         .map((m) => {
@@ -144,7 +143,7 @@ ${threadText || "(Not run in a thread)"}`;
     },
     {
       role: "user",
-      content: command.text || "Please help me based on the thread context above.",
+      content: text || "Please help me based on the thread context above.",
     },
   ];
 
@@ -221,20 +220,55 @@ ${threadText || "(Not run in a thread)"}`;
   }
 
   // Reply
-  if (command.thread_ts) {
+  if (thread_ts) {
     try {
       await slackClient.chat.postMessage({
-        channel: command.channel_id,
-        thread_ts: command.thread_ts,
+        channel: channel_id,
+        thread_ts: thread_ts,
         text: answerText,
       });
     } catch (postError) {
       console.error("Failed to post message to thread:", postError);
-      await respond({ text: answerText });
+      if (respond) await respond({ text: answerText });
     }
   } else {
-    await respond({ text: answerText });
+    if (respond) {
+      await respond({ text: answerText });
+    } else {
+      await slackClient.chat.postMessage({
+        channel: channel_id,
+        text: answerText,
+      });
+    }
   }
+}
+
+app.command("/ai-help", async ({ command, ack, respond, client: slackClient }) => {
+  await ack();
+  console.log("AI-HELP payload:", JSON.stringify(command, null, 2));
+  await handleAIHelp({
+    channel_id: command.channel_id,
+    thread_ts: command.thread_ts,
+    text: command.text,
+    slackClient,
+    respond,
+  });
+});
+
+app.event("app_mention", async ({ event, client: slackClient }) => {
+  console.log("APP_MENTION payload:", JSON.stringify(event, null, 2));
+  // Strip bot user mention from text (e.g. <@U12345> help -> help)
+  const cleanText = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
+  // If mentioned in a thread, reply in thread (event.thread_ts)
+  // If mentioned in main chat, reply in thread on the mention message (event.ts)
+  const targetThreadTs = event.thread_ts || event.ts;
+
+  await handleAIHelp({
+    channel_id: event.channel,
+    thread_ts: targetThreadTs,
+    text: cleanText,
+    slackClient,
+  });
 });
 
 (async () => {
