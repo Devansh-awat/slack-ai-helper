@@ -1,7 +1,5 @@
 require("dotenv").config();
 
-const fs = require("fs");
-const path = require("path");
 const { App } = require("@slack/bolt");
 
 const app = new App({
@@ -9,88 +7,6 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true
 });
-
-function searchWorkspace(query) {
-  const rootDir = process.cwd();
-  const results = [];
-  const maxResults = 10;
-  const maxLineLength = 200;
-
-  function walk(dir) {
-    if (results.length >= maxResults) return;
-
-    let files;
-    try {
-      files = fs.readdirSync(dir);
-    } catch (err) {
-      return;
-    }
-
-    for (const file of files) {
-      if (results.length >= maxResults) return;
-
-      const fullPath = path.join(dir, file);
-      let stat;
-      try {
-        stat = fs.statSync(fullPath);
-      } catch (err) {
-        continue;
-      }
-
-      if (stat.isDirectory()) {
-        if (file === "node_modules" || file === ".git" || file === ".github" || file === "dist" || file === "build") {
-          continue;
-        }
-        walk(fullPath);
-      } else if (stat.isFile()) {
-        if (
-          file === "package-lock.json" ||
-          file === "yarn.lock" ||
-          file === "pnpm-lock.yaml" ||
-          file === ".env" ||
-          file.endsWith(".png") ||
-          file.endsWith(".jpg") ||
-          file.endsWith(".jpeg") ||
-          file.endsWith(".gif") ||
-          file.endsWith(".ico") ||
-          file.endsWith(".pdf") ||
-          file.endsWith(".zip")
-        ) {
-          continue;
-        }
-
-        try {
-          const content = fs.readFileSync(fullPath, "utf8");
-          if (content.toLowerCase().includes(query.toLowerCase())) {
-            const relativePath = path.relative(rootDir, fullPath);
-            const lines = content.split("\n");
-            const matchingLines = [];
-
-            for (let i = 0; i < lines.length; i++) {
-              if (lines[i].toLowerCase().includes(query.toLowerCase())) {
-                let lineText = lines[i].trim();
-                if (lineText.length > maxLineLength) {
-                  lineText = lineText.substring(0, maxLineLength) + "...";
-                }
-                matchingLines.push({ line: i + 1, content: lineText });
-              }
-            }
-
-            results.push({
-              file: relativePath,
-              matches: matchingLines.slice(0, 5)
-            });
-          }
-        } catch (err) {
-          // ignore read errors
-        }
-      }
-    }
-  }
-
-  walk(rootDir);
-  return results;
-}
 
 app.command("/ai-ping", async ({ command, ack, respond }) => {
   const start = Date.now();
@@ -136,16 +52,18 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
   }
 
   const systemPrompt = `You are a Slack AI assistant helping developers in a workspace thread.
-You have access to three tools:
-1. search_codebase: Search the local codebase directory files for code/documentation.
-2. search_channel_history: Search the last 100 messages in the current Slack channel to find previous messages, context, or what developers said. Use this when asked about previous discussions or context in the current channel.
-3. search_slack_workspace: Search all public channels and messages in the entire Slack workspace. Use this when asked to search Slack generally, look up past messages in other channels, or find discussions outside the current channel.
+You have access to the following tools:
+1. search_channel_history: Search the last 100 messages in the current Slack channel to find previous messages, context, or what developers said. Use this when asked about previous discussions or context in the current channel.
+2. search_slack_workspace: Search all public channels and messages in the entire Slack workspace. Use this when asked to search Slack generally, look up past messages in other channels, or find discussions outside the current channel.
+3. list_channels: List all public channels in the Slack workspace to find channel names and IDs. Useful to find channels like #welcome, #faq, etc.
+4. list_channel_bookmarks: List all bookmarks/tabs at the top of a specific Slack channel by its ID. Use this to find FAQ links, spreadsheets, or documents pinned as tabs.
+5. read_web_page: Fetch the content of a public URL. Use this to read the content of bookmarks or links you find.
 
 Citing sources:
-- If you find information from local codebase files, cite the relative file path.
 - If you find information from Slack messages, cite the sender (using their <@USER_ID> if available) and provide the message permalink URL as the source.
+- If you find information from bookmarks, docs, or web links, cite the bookmark title and provide the URL.
 
-If the thread history does not have enough information to answer, use the appropriate search tool.
+If the thread history does not have enough information to answer, use the appropriate search/list tools to locate the answer.
 If you are still not confident in your answer or cannot find the answer, you MUST say so clearly and NOT hallucinate an answer.
 
 Thread History:
@@ -163,23 +81,6 @@ ${threadText || "(Not run in a thread)"}`;
   ];
 
   const tools = [
-    {
-      type: "function",
-      function: {
-        name: "search_codebase",
-        description: "Search the local codebase directory files for code, configuration, or documentation matching the query.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "The term or phrase to search for in the files.",
-            },
-          },
-          required: ["query"],
-        },
-      },
-    },
     {
       type: "function",
       function: {
@@ -211,6 +112,51 @@ ${threadText || "(Not run in a thread)"}`;
             },
           },
           required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "list_channels",
+        description: "List all public channels in the Slack workspace to find channel names and IDs.",
+        parameters: {
+          type: "object",
+          properties: {},
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "list_channel_bookmarks",
+        description: "List all bookmarks (tabs) in a specific Slack channel by its channel ID.",
+        parameters: {
+          type: "object",
+          properties: {
+            channel_id: {
+              type: "string",
+              description: "The ID of the Slack channel (e.g. C12345).",
+            },
+          },
+          required: ["channel_id"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_web_page",
+        description: "Fetch and read the text content of a public URL (e.g., from a bookmark or external FAQ).",
+        parameters: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description: "The full URL to read.",
+            },
+          },
+          required: ["url"],
         },
       },
     },
@@ -248,22 +194,7 @@ ${threadText || "(Not run in a thread)"}`;
         messages.push(message);
 
         for (const toolCall of message.tool_calls) {
-          if (toolCall.function.name === "search_codebase" || toolCall.function.name === "search_workspace") {
-            let args;
-            try {
-              args = JSON.parse(toolCall.function.arguments);
-            } catch (err) {
-              args = { query: toolCall.function.arguments };
-            }
-            const searchResults = searchWorkspace(args.query || "");
-
-            messages.push({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              name: toolCall.function.name,
-              content: JSON.stringify(searchResults),
-            });
-          } else if (toolCall.function.name === "search_channel_history") {
+          if (toolCall.function.name === "search_channel_history") {
             let args;
             try {
               args = JSON.parse(toolCall.function.arguments);
