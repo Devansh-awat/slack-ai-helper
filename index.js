@@ -35,23 +35,10 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
   let threadText = "";
   if (thread_ts) {
     try {
-      let replies;
-      try {
-        replies = await slackClient.conversations.replies({
-          channel: channel_id,
-          ts: thread_ts,
-        });
-      } catch (replyErr) {
-        if (replyErr.code === "slack_webapi_platform_error" && replyErr.data.error === "not_in_channel") {
-          await slackClient.conversations.join({ channel: channel_id });
-          replies = await slackClient.conversations.replies({
-            channel: channel_id,
-            ts: thread_ts,
-          });
-        } else {
-          throw replyErr;
-        }
-      }
+      const replies = await slackClient.conversations.replies({
+        channel: channel_id,
+        ts: thread_ts,
+      });
       threadText = replies.messages
         .map((m) => {
           const sender = m.user ? `<@${m.user}>` : `Bot (${m.username || m.bot_id})`;
@@ -60,11 +47,26 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
         .join("\n");
     } catch (error) {
       console.error("Failed to fetch thread replies:", error);
+      if (error.code === "slack_webapi_platform_error" && error.data.error === "not_in_channel") {
+        const notInChannelMsg = "The bot is not a member of this channel. Please invite the bot first (by typing `/invite @AI help bot` in that channel).";
+        if (respond) {
+          await respond({ text: notInChannelMsg });
+        } else {
+          await slackClient.chat.postMessage({
+            channel: channel_id,
+            thread_ts: thread_ts,
+            text: notInChannelMsg,
+          });
+        }
+        return;
+      }
       threadText = "Could not fetch thread messages due to an error.";
     }
   }
 
   const systemPrompt = `You are a strict, highly concise Slack AI assistant helping users in this workspace.
+
+Current Channel ID: ${channel_id}
 
 You MUST follow these rules:
 1. CONCISENESS: Keep your final response short, direct, and under 3 sentences. No fluff.
@@ -206,24 +208,10 @@ ${threadText || "(Not run in a thread)"}`;
             const targetChannel = args.channel_id || channel_id;
             let searchResults = [];
             try {
-              let history;
-              try {
-                history = await slackClient.conversations.history({
-                  channel: targetChannel,
-                  limit: 100,
-                });
-              } catch (historyErr) {
-                // If bot is not in the public channel, try joining it
-                if (historyErr.code === "slack_webapi_platform_error" && historyErr.data.error === "not_in_channel") {
-                  await slackClient.conversations.join({ channel: targetChannel });
-                  history = await slackClient.conversations.history({
-                    channel: targetChannel,
-                    limit: 100,
-                  });
-                } else {
-                  throw historyErr;
-                }
-              }
+              const history = await slackClient.conversations.history({
+                channel: targetChannel,
+                limit: 100,
+              });
 
               searchResults = history.messages
                 .filter((m) => m.text && m.text.toLowerCase().includes(args.query.toLowerCase()))
@@ -234,7 +222,11 @@ ${threadText || "(Not run in a thread)"}`;
                 }));
             } catch (err) {
               console.error(`Failed to search channel history for ${targetChannel}:`, err);
-              searchResults = { error: `Failed to search channel history: ${err.message}` };
+              if (err.code === "slack_webapi_platform_error" && err.data.error === "not_in_channel") {
+                searchResults = { error: `The bot is not a member of channel ${targetChannel}. Please instruct the user to invite the bot first by typing '/invite @AI help bot' in that channel.` };
+              } else {
+                searchResults = { error: `Failed to search channel history: ${err.message}` };
+              }
             }
 
             messages.push({
@@ -280,21 +272,9 @@ ${threadText || "(Not run in a thread)"}`;
 
             let searchResults = [];
             try {
-              let res;
-              try {
-                res = await slackClient.bookmarks.list({
-                  channel: args.channel_id,
-                });
-              } catch (bookmarkErr) {
-                if (bookmarkErr.code === "slack_webapi_platform_error" && bookmarkErr.data.error === "not_in_channel") {
-                  await slackClient.conversations.join({ channel: args.channel_id });
-                  res = await slackClient.bookmarks.list({
-                    channel: args.channel_id,
-                  });
-                } else {
-                  throw bookmarkErr;
-                }
-              }
+              const res = await slackClient.bookmarks.list({
+                channel: args.channel_id,
+              });
 
               if (res.ok && res.bookmarks) {
                 searchResults = res.bookmarks.map((b) => ({
@@ -306,9 +286,13 @@ ${threadText || "(Not run in a thread)"}`;
               }
             } catch (err) {
               console.error("Failed to list channel bookmarks:", err);
-              searchResults = {
-                error: `Failed to list bookmarks: ${err.message}. If this is a missing scope error, make sure the Slack App has 'bookmarks:read' scope enabled in the developer dashboard.`,
-              };
+              if (err.code === "slack_webapi_platform_error" && err.data.error === "not_in_channel") {
+                searchResults = { error: `The bot is not a member of channel ${args.channel_id}. Please instruct the user to invite the bot first by typing '/invite @AI help bot' in that channel.` };
+              } else {
+                searchResults = {
+                  error: `Failed to list bookmarks: ${err.message}. If this is a missing scope error, make sure the Slack App has 'bookmarks:read' scope enabled in the developer dashboard.`,
+                };
+              }
             }
 
             messages.push({
