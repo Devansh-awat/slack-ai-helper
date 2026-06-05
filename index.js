@@ -99,6 +99,15 @@ app.command("/ai-ping", async ({ command, ack, respond }) => {
   await respond({ text: `Pong!\nLatency: ${latency}ms` });
 });
 
+function convertMarkdownToMrkdwn(text) {
+  if (!text) return "";
+  return text
+    // Replace markdown bold (**text**) with Slack bold (*text*)
+    .replace(/\*\*(.*?)\*\*/g, "*$1*")
+    // Replace markdown links ([text](url)) with Slack links (<url|text>)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+}
+
 async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond }) {
   if (!process.env.HACKAI_KEY) {
     const errorText = "Bot configuration error: HACKAI_KEY is missing.";
@@ -127,8 +136,15 @@ async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond 
   }
 
   const systemPrompt = `You are a Slack AI assistant helping developers in a workspace thread.
-You have access to a tool to search the local workspace files for code/documentation.
-If the thread history does not have enough information to answer, use the search_workspace tool.
+You have access to two tools:
+1. search_workspace: Search the local codebase files for files/code.
+2. search_channel_history: Search the last 100 messages in the current Slack channel to find previous messages, context, or what developers said. Use this when asked about previous discussions or context in the channel.
+
+Citing sources:
+- If you find information from local workspace files, cite the relative file path.
+- If you find information from previous channel messages, cite the sender (using their <@USER_ID> if available) and reference what they said.
+
+If the thread history does not have enough information to answer, use the appropriate search tool.
 If you are still not confident in your answer or cannot find the answer, you MUST say so clearly and NOT hallucinate an answer.
 
 Thread History:
@@ -157,6 +173,23 @@ ${threadText || "(Not run in a thread)"}`;
             query: {
               type: "string",
               description: "The term or phrase to search for in the files.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "search_channel_history",
+        description: "Search the recent messages in the current Slack channel for matching context or previous messages.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The term or phrase to search for in the recent message history.",
             },
           },
           required: ["query"],
@@ -212,6 +245,37 @@ ${threadText || "(Not run in a thread)"}`;
               name: "search_workspace",
               content: JSON.stringify(searchResults),
             });
+          } else if (toolCall.function.name === "search_channel_history") {
+            let args;
+            try {
+              args = JSON.parse(toolCall.function.arguments);
+            } catch (err) {
+              args = { query: toolCall.function.arguments };
+            }
+
+            let searchResults = [];
+            try {
+              const history = await slackClient.conversations.history({
+                channel: channel_id,
+                limit: 100,
+              });
+              searchResults = history.messages
+                .filter((m) => m.text && m.text.toLowerCase().includes(args.query.toLowerCase()))
+                .map((m) => ({
+                  user: m.user || m.bot_id || "Unknown",
+                  text: m.text,
+                  ts: m.ts,
+                }));
+            } catch (err) {
+              console.error("Failed to search channel history:", err);
+            }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              name: "search_channel_history",
+              content: JSON.stringify(searchResults),
+            });
           }
         }
         loopCount++;
@@ -229,25 +293,27 @@ ${threadText || "(Not run in a thread)"}`;
     answerText = `Error calling Gemini API: ${error.message}`;
   }
 
+  const formattedAnswerText = convertMarkdownToMrkdwn(answerText);
+
   // Reply
   if (thread_ts) {
     try {
       await slackClient.chat.postMessage({
         channel: channel_id,
         thread_ts: thread_ts,
-        text: answerText,
+        text: formattedAnswerText,
       });
     } catch (postError) {
       console.error("Failed to post message to thread:", postError);
-      if (respond) await respond({ text: answerText });
+      if (respond) await respond({ text: formattedAnswerText });
     }
   } else {
     if (respond) {
-      await respond({ text: answerText });
+      await respond({ text: formattedAnswerText });
     } else {
       await slackClient.chat.postMessage({
         channel: channel_id,
-        text: answerText,
+        text: formattedAnswerText,
       });
     }
   }
