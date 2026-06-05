@@ -10,8 +10,6 @@ const app = new App({
   socketMode: true
 });
 
-let client;
-
 function searchWorkspace(query) {
   const rootDir = process.cwd();
   const results = [];
@@ -102,8 +100,8 @@ app.command("/ai-ping", async ({ command, ack, respond }) => {
 });
 
 async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond }) {
-  if (!client) {
-    const errorText = "Bot is still starting up, please try again in a moment.";
+  if (!process.env.HACKAI_KEY) {
+    const errorText = "Bot configuration error: HACKAI_KEY is missing.";
     if (respond) await respond({ text: errorText });
     else await slackClient.chat.postMessage({ channel: channel_id, thread_ts, text: errorText });
     return;
@@ -173,16 +171,26 @@ ${threadText || "(Not run in a thread)"}`;
     let keepRunning = true;
 
     while (loopCount < 3 && keepRunning) {
-      const response = await client.chat.send({
-        chatRequest: {
+      const res = await fetch("https://ai.hackclub.com/proxy/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.HACKAI_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
           model: "google/gemini-3.1-flash-lite",
           messages,
-          tools,
-        },
-        stream: false,
+          tools
+        })
       });
 
-      const choice = response.choices[0];
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`API error (Status ${res.status}): ${errText}`);
+      }
+
+      const data = await res.json();
+      const choice = data.choices[0];
       const message = choice.message;
 
       if (message.tool_calls && message.tool_calls.length > 0) {
@@ -274,12 +282,6 @@ app.event("app_mention", async ({ event, client: slackClient }) => {
 });
 
 (async () => {
-  const { OpenRouter } = await import("@openrouter/sdk");
-  client = new OpenRouter({
-    apiKey: process.env.HACKAI_KEY,
-    serverURL: "https://ai.hackclub.com/proxy/v1",
-  });
-
   await app.start();
   console.log("bot is running!");
 })();
