@@ -277,7 +277,7 @@ app.event("app_mention", async ({ event, client: slackClient }) => {
   const { OpenRouter } = await import("@openrouter/sdk");
   client = new OpenRouter({
     apiKey: process.env.HACKAI_KEY,
-    baseURL: "https://ai.hackclub.com/proxy/v1",
+    serverURL: "https://ai.hackclub.com/proxy/v1",
   });
 
   await app.start();
