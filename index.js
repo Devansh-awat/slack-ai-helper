@@ -174,9 +174,11 @@ ${threadText || "(Not run in a thread)"}`;
 
     while (loopCount < 3 && keepRunning) {
       const response = await client.chat.send({
-        model: "google/gemini-3.1-flash-lite",
-        messages,
-        tools,
+        chatRequest: {
+          model: "google/gemini-3.1-flash-lite",
+          messages,
+          tools,
+        },
         stream: false,
       });
 
