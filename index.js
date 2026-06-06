@@ -1,6 +1,30 @@
 require("dotenv").config();
 
+const fs = require("fs");
+const path = require("path");
 const { App } = require("@slack/bolt");
+
+// Simple file-backed counter so stats survive process restarts.
+const STATS_FILE = path.join(__dirname, "stats.json");
+
+function getStats() {
+  try {
+    return JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
+  } catch (err) {
+    return { answered: 0 };
+  }
+}
+
+function recordAnswer() {
+  const stats = getStats();
+  stats.answered = (stats.answered || 0) + 1;
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats));
+  } catch (err) {
+    console.error("Failed to write stats:", err);
+  }
+  return stats.answered;
+}
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -543,6 +567,10 @@ ${threadText || "(Not run in a thread)"}`;
 
   const formattedAnswerText = convertMarkdownToMrkdwn(answerText);
 
+  // Count this as a question answered (any early return above skips this).
+  const total = recordAnswer();
+  console.log(`[stats] questions answered: ${total}`);
+
   // Reply
   if (thread_ts) {
     try {
@@ -567,15 +595,29 @@ ${threadText || "(Not run in a thread)"}`;
   }
 }
 
-app.command("/ai-help", async ({ command, ack, respond, client: slackClient }) => {
+app.command("/ai-help", async ({ ack, respond }) => {
   await ack();
-  console.log("AI-HELP payload:", JSON.stringify(command, null, 2));
-  await handleAIHelp({
-    channel_id: command.channel_id,
-    thread_ts: command.thread_ts,
-    text: command.text,
-    slackClient,
-    respond,
+  const helpText = [
+    "*AI help bot — how to use me*",
+    "",
+    "• *Ask a question:* mention me in any channel or thread, e.g. `@AI help bot how do I track my time?`",
+    "   I search the workspace history, channel bookmarks, and FAQ canvases, then answer with cited sources and message links.",
+    "• Add me to a channel first with `/invite @AI help bot` so I can read it.",
+    "",
+    "*Commands*",
+    "• `/ai-help` — show this help",
+    "• `/ai-stats` — how many questions I've answered",
+    "• `/ai-ping` — check that I'm online",
+  ].join("\n");
+  await respond({ response_type: "ephemeral", text: helpText });
+});
+
+app.command("/ai-stats", async ({ ack, respond }) => {
+  await ack();
+  const { answered = 0 } = getStats();
+  await respond({
+    response_type: "ephemeral",
+    text: `:bar_chart: I've answered *${answered}* question${answered === 1 ? "" : "s"} so far.`,
   });
 });
 
