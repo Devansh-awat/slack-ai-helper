@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
-const { App } = require("@slack/bolt");
+const { App, Assistant } = require("@slack/bolt");
 
 // Simple file-backed counter so stats survive process restarts.
 const STATS_FILE = path.join(__dirname, "stats.json");
@@ -54,7 +54,7 @@ function convertMarkdownToMrkdwn(text) {
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
 }
 
-async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond }) {
+async function handleAIHelp({ channel_id, thread_ts, text, slackClient, respond, actionToken, say }) {
   if (!process.env.HACKAI_KEY) {
     const errorText = "Bot configuration error: HACKAI_KEY is missing.";
     if (respond) await respond({ text: errorText });
@@ -304,13 +304,35 @@ ${threadText || "(Not run in a thread)"}`;
               args = { query: toolCall.function.arguments };
             }
 
+            // Clickable profile link that does NOT ping the user (Slack treats
+            // <url|text> as a link, not a mention). Falls back to a plain handle.
+            const mapAuthor = (userId, name) =>
+              userId && TEAM_ID
+                ? `<https://app.slack.com/client/${TEAM_ID}/${userId}|@${name || "user"}>`
+                : `@${name || "user"}`;
+
             let searchResults;
-            if (!process.env.SLACK_USER_TOKEN) {
-              searchResults = {
-                error: "search_messages is not configured: missing SLACK_USER_TOKEN (a user token with the 'search:read' scope). Fall back to search_channel_history.",
-              };
-            } else {
-              try {
+            try {
+              if (actionToken) {
+                // Preferred: bot-token org-wide PUBLIC search via the AI-app
+                // method. No user token, no channel membership needed.
+                const sr = await slackClient.apiCall("assistant.search.context", {
+                  query: args.query,
+                  action_token: actionToken,
+                  channel_types: "public_channel",
+                  content_types: "messages",
+                });
+                const msgs = (sr.results && sr.results.messages) || [];
+                searchResults = msgs.map((m) => ({
+                  author: mapAuthor(m.author_user_id, m.author_name),
+                  channel: m.channel_name ? `#${m.channel_name}` : m.channel_id || "",
+                  text: m.content,
+                  permalink: m.permalink,
+                }));
+                console.log(`[tool] assistant.search.context -> ${searchResults.length} matches`);
+              } else if (process.env.SLACK_USER_TOKEN) {
+                // Fallback: legacy user-token search (used when no action_token,
+                // e.g. invoked outside a user message event).
                 const sr = await slackClient.search.messages({
                   token: process.env.SLACK_USER_TOKEN,
                   query: args.query,
@@ -318,30 +340,25 @@ ${threadText || "(Not run in a thread)"}`;
                   sort: "score",
                 });
                 const matches = (sr.messages && sr.messages.matches) || [];
-                searchResults = matches.map((m) => {
-                  const name = m.username || "user";
-                  // Clickable profile link that does NOT ping the user (Slack
-                  // treats <url|text> as a link, not a mention). Falls back to
-                  // a plain handle if we don't have the id/team.
-                  const author =
-                    m.user && TEAM_ID
-                      ? `<https://app.slack.com/client/${TEAM_ID}/${m.user}|@${name}>`
-                      : `@${name}`;
-                  return {
-                    author,
-                    channel: m.channel ? (m.channel.name ? `#${m.channel.name}` : m.channel.id) : "",
-                    text: m.text,
-                    permalink: m.permalink,
-                  };
-                });
-                console.log(`[tool] search_messages -> ${searchResults.length} matches`);
-                if (searchResults.length === 0) {
-                  searchResults = { info: "No messages found for that query." };
-                }
-              } catch (err) {
-                console.error("search_messages failed:", err);
-                searchResults = { error: `Search failed: ${err.message}` };
+                searchResults = matches.map((m) => ({
+                  author: mapAuthor(m.user, m.username),
+                  channel: m.channel ? (m.channel.name ? `#${m.channel.name}` : m.channel.id) : "",
+                  text: m.text,
+                  permalink: m.permalink,
+                }));
+                console.log(`[tool] search.messages(user) -> ${searchResults.length} matches`);
+              } else {
+                searchResults = {
+                  error: "Search unavailable: no action_token for bot-token search and no SLACK_USER_TOKEN configured.",
+                };
               }
+
+              if (Array.isArray(searchResults) && searchResults.length === 0) {
+                searchResults = { info: "No messages found for that query." };
+              }
+            } catch (err) {
+              console.error("search_messages failed:", err);
+              searchResults = { error: `Search failed: ${err.message}` };
             }
 
             messages.push({
@@ -571,8 +588,10 @@ ${threadText || "(Not run in a thread)"}`;
   const total = recordAnswer();
   console.log(`[stats] questions answered: ${total}`);
 
-  // Reply
-  if (thread_ts) {
+  // Reply. In the assistant pane, `say` posts into the assistant thread.
+  if (say) {
+    await say(formattedAnswerText);
+  } else if (thread_ts) {
     try {
       await slackClient.chat.postMessage({
         channel: channel_id,
@@ -634,8 +653,48 @@ app.event("app_mention", async ({ event, client: slackClient }) => {
     thread_ts: targetThreadTs,
     text: cleanText,
     slackClient,
+    // Token may be nested (when mentioned in an assistant thread) or top-level.
+    actionToken: (event.assistant_thread && event.assistant_thread.action_token) || event.action_token,
   });
 });
+
+// --- Assistant (Agents & AI Apps) surface ---------------------------------
+// The side-panel assistant. User messages here carry an action_token, which
+// lets us run bot-token org-wide public search via assistant.search.context.
+const assistant = new Assistant({
+  threadStarted: async ({ say, setSuggestedPrompts }) => {
+    try {
+      await say("Hi! Ask me anything about this workspace — I'll search public channels and answer with cited sources.");
+      await setSuggestedPrompts({
+        title: "Try asking:",
+        prompts: [
+          { title: "Find a policy", message: "What's the policy on AI usage in Stardance?" },
+          { title: "Catch up", message: "Summarize recent discussion about hardware projects." },
+        ],
+      });
+    } catch (err) {
+      console.error("assistant threadStarted failed:", err);
+    }
+  },
+  userMessage: async ({ message, client: assistantClient, say, setStatus }) => {
+    try {
+      await setStatus("is thinking…");
+      await handleAIHelp({
+        channel_id: message.channel,
+        thread_ts: message.thread_ts || message.ts,
+        text: (message.text || "").replace(/<@[A-Z0-9]+>/g, "").trim(),
+        slackClient: assistantClient,
+        say,
+        // In assistant threads the token is nested here (not at top level).
+        actionToken: (message.assistant_thread && message.assistant_thread.action_token) || message.action_token,
+      });
+    } catch (err) {
+      console.error("assistant userMessage failed:", err);
+      await say("Sorry, something went wrong answering that.");
+    }
+  },
+});
+app.assistant(assistant);
 
 (async () => {
   await app.start();
