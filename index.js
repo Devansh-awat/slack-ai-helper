@@ -279,7 +279,7 @@ ${threadText || "(Not run in a thread)"}`;
           "Authorization": `Bearer ${process.env.GEMINI_API_KEY}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ ...body, model: "gemini-2.0-flash-lite" })
+        body: JSON.stringify({ ...body, model: "gemini-3.1-flash-lite" })
       });
     }
 
