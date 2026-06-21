@@ -127,13 +127,12 @@ Tools at your disposal:
 - read_web_page: Fetches text from a bookmark or document URL.
 - read_canvas: Reads the full text of a Slack Canvas (e.g. an FAQ) by its file ID.
 
-${
-  canvasDocs.length
-    ? `Canvases available in this thread (call read_canvas with the id to read them — the FAQ likely answers the question):\n${canvasDocs
+${canvasDocs.length
+      ? `Canvases available in this thread (call read_canvas with the id to read them — the FAQ likely answers the question):\n${canvasDocs
         .map((d) => `- ${d.id}: "${d.title}"`)
         .join("\n")}`
-    : "(No canvases detected in this thread.)"
-}
+      : "(No canvases detected in this thread.)"
+    }
 
 Thread History:
 ${threadText || "(Not run in a thread)"}`;
@@ -265,7 +264,7 @@ ${threadText || "(Not run in a thread)"}`;
       body.tool_choice = "none";
     }
 
-    const res = await fetch("https://ai.hackclub.com/proxy/v1/chat/completions", {
+    let res = await fetch("https://ai.hackclub.com/proxy/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.HACKAI_KEY}`,
@@ -273,6 +272,16 @@ ${threadText || "(Not run in a thread)"}`;
       },
       body: JSON.stringify(body)
     });
+    if (res.status === 402) {
+      res = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.GEMINI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ ...body, model: "gemini-2.0-flash-lite" })
+      });
+    }
 
     if (!res.ok) {
       const errText = await res.text();
