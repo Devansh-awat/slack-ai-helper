@@ -133,9 +133,10 @@ You MUST follow these rules:
    - First call lookup_user to resolve the person. It returns matches and a ready-to-use "from:" filter in its hint (e.g. from:<@U09UE480JHH>). Pick the FIRST match unless its title clearly describes a different person.
    - Then search using that exact from: filter, e.g. query "cheese from:<@U09UE480JHH>". You may combine operators, e.g. "cheese from:<@U09UE480JHH> in:#random".
    - Only after that from: search returns nothing should you conclude the person sent no such message.
+6. SEARCH OPERATORS: search_messages also supports has: (e.g. has:link, has:star) and date-bounded before:/after: (e.g. before:2026-01-01, after:2026-01-01), same as Slack's own search bar. Combine freely with from:/in:, e.g. "deploy has:link after:2026-06-01 in:#eng".
 
 Tools at your disposal:
-- search_messages: PREFERRED. Searches ALL channels and threads across the workspace by relevance (includes replies inside threads). Use this first for any factual question. Supports Slack operators like from:@handle and in:#channel.
+- search_messages: PREFERRED. Searches ALL channels and threads across the workspace by relevance (includes replies inside threads). Use this first for any factual question. Supports Slack operators like from:@handle, in:#channel, has:link/has:star, and before:/after: date bounds.
 - lookup_user: Resolves a person's name or handle to their Slack @handle and user ID. Use this BEFORE an author-scoped (from:) search.
 - search_channel_history: Fallback. Scans only recent top-level messages in one channel (does NOT see thread replies).
 - list_channels: Lists public channel names and IDs.
