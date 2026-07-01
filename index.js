@@ -42,12 +42,23 @@ app.command("/ai-ping", async ({ command, ack, respond }) => {
   await respond({ text: `Pong!\nLatency: ${latency}ms` });
 });
 
-function convertMarkdownToMrkdwn(text) {
+// authorLinks maps a lowercased display name -> a clickable, NON-pinging
+// profile link (<url|@name>). It's populated from search/lookup results so we
+// can rewrite any "<@Display Name>" the model invents into a real link.
+function convertMarkdownToMrkdwn(text, authorLinks = {}) {
   if (!text) return "";
   return text
-    // Neutralize any user mentions so the bot never pings people or exposes
+    // Neutralize real user mentions so the bot never pings people or exposes
     // profiles from channels the asker may not share. <@U123> -> "a user".
     .replace(/<@[A-Z0-9]+>/g, "a user")
+    // The model sometimes emits "<@Display Name>" (a name, not a real ID).
+    // Slack won't render that as a mention, so it leaks as literal "<@...>"
+    // text. If we have a clickable profile link for that name use it (clickable,
+    // no ping); otherwise fall back to the plain name.
+    .replace(/<@([^>]+)>/g, (_m, name) => {
+      const link = authorLinks[name.trim().toLowerCase()];
+      return link || name;
+    })
     // Replace markdown bold (**text**) with Slack bold (*text*)
     .replace(/\*\*(.*?)\*\*/g, "*$1*")
     // Replace markdown links ([text](url)) with Slack links (<url|text>)
@@ -118,9 +129,14 @@ You MUST follow these rules:
    - If citing bookmarks or canvases: Reference the tab/doc title and provide the exact URL.
 3. USE WHAT YOU FIND: If the tools return messages that are relevant to the question, summarize the answer from them and cite the source — even if no single message states it word-for-word. Do NOT answer from your own general training knowledge. Only reply "I cannot find the answer to this in the Slack history or bookmarks." when the tool results genuinely contain nothing relevant to the question.
 4. TOOL EXECUTION: Always call search_messages FIRST to gather facts before answering. Try at least one search (and refine the query if the first results are noisy) before concluding you cannot find an answer.
+5. AUTHOR-SCOPED QUESTIONS: When the question is about messages a specific PERSON sent (e.g. "find a message zrl sent about cheese"), do NOT just put their name in the query as a keyword — that only matches messages whose text contains their name, not messages they authored. Instead:
+   - First call lookup_user to resolve the person. It returns matches and a ready-to-use "from:" filter in its hint (e.g. from:<@U09UE480JHH>). Pick the FIRST match unless its title clearly describes a different person.
+   - Then search using that exact from: filter, e.g. query "cheese from:<@U09UE480JHH>". You may combine operators, e.g. "cheese from:<@U09UE480JHH> in:#random".
+   - Only after that from: search returns nothing should you conclude the person sent no such message.
 
 Tools at your disposal:
-- search_messages: PREFERRED. Searches ALL channels and threads across the workspace by relevance (includes replies inside threads). Use this first for any factual question.
+- search_messages: PREFERRED. Searches ALL channels and threads across the workspace by relevance (includes replies inside threads). Use this first for any factual question. Supports Slack operators like from:@handle and in:#channel.
+- lookup_user: Resolves a person's name or handle to their Slack @handle and user ID. Use this BEFORE an author-scoped (from:) search.
 - search_channel_history: Fallback. Scans only recent top-level messages in one channel (does NOT see thread replies).
 - list_channels: Lists public channel names and IDs.
 - list_channel_bookmarks: Lists bookmarks/tabs in a channel.
@@ -163,6 +179,23 @@ ${threadText || "(Not run in a thread)"}`;
             },
           },
           required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "lookup_user",
+        description: "Resolve a person's name or handle (e.g. 'zrl' or 'Zach') to their Slack @handle and user ID. Call this before doing a 'from:@handle' author-scoped search_messages query.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "The name, display name, or handle to look up (e.g. 'zrl').",
+            },
+          },
+          required: ["name"],
         },
       },
     },
@@ -253,10 +286,18 @@ ${threadText || "(Not run in a thread)"}`;
 
   const MAX_TOOL_ROUNDS = 10;
 
+  // Gemini bills against the daily spending cap as max_tokens * price, reserved
+  // up front per request. Leaving it unset makes each call reserve the model's
+  // full output window, which burns through the $3/day limit in a handful of
+  // requests. Capping it keeps each reservation small so we can spread real
+  // usage across the whole budget. Slack answers rarely need more than this.
+  const MAX_OUTPUT_TOKENS = 2048;
+
   async function callModel(includeTools) {
     const body = {
       model: "google/gemini-3.1-flash-lite",
       messages,
+      max_tokens: MAX_OUTPUT_TOKENS,
     };
     if (includeTools) {
       body.tools = tools;
@@ -272,7 +313,10 @@ ${threadText || "(Not run in a thread)"}`;
       },
       body: JSON.stringify(body)
     });
-    if (res.status === 402) {
+    // 402: hackclub proxy out of credit. 429: proxy hit its own daily Gemini
+    // spending cap ("Daily spending limit of $3 reached"). Either way, fall
+    // back to our own Gemini key.
+    if (res.status === 402 || res.status === 429) {
       res = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
         method: "POST",
         headers: {
@@ -291,6 +335,11 @@ ${threadText || "(Not run in a thread)"}`;
     const data = await res.json();
     return data.choices[0].message;
   }
+
+  // name (lowercased) -> clickable, non-pinging profile link. Populated as we
+  // map authors from search/lookup results, then used to rewrite any
+  // "<@Name>" the model emits into a real link at format time.
+  const authorLinks = {};
 
   let answerText = "";
   try {
@@ -315,10 +364,16 @@ ${threadText || "(Not run in a thread)"}`;
 
             // Clickable profile link that does NOT ping the user (Slack treats
             // <url|text> as a link, not a mention). Falls back to a plain handle.
-            const mapAuthor = (userId, name) =>
-              userId && TEAM_ID
-                ? `<https://app.slack.com/client/${TEAM_ID}/${userId}|@${name || "user"}>`
-                : `@${name || "user"}`;
+            // Also records the link under the name so we can recover it if the
+            // model later writes "<@Name>" instead of copying the link.
+            const mapAuthor = (userId, name) => {
+              const link =
+                userId && TEAM_ID
+                  ? `<https://app.slack.com/client/${TEAM_ID}/${userId}|@${name || "user"}>`
+                  : `@${name || "user"}`;
+              if (name && userId && TEAM_ID) authorLinks[name.toLowerCase()] = link;
+              return link;
+            };
 
             let searchResults;
             try {
@@ -340,8 +395,9 @@ ${threadText || "(Not run in a thread)"}`;
                 }));
                 console.log(`[tool] assistant.search.context -> ${searchResults.length} matches`);
               } else if (process.env.SLACK_USER_TOKEN) {
-                // Fallback: legacy user-token search (used when no action_token,
-                // e.g. invoked outside a user message event).
+                // Fallback only (no action_token, e.g. invoked outside a user
+                // message event). User-token search is org-limited to the
+                // token owner's channels — see the cross-user leak note.
                 const sr = await slackClient.search.messages({
                   token: process.env.SLACK_USER_TOKEN,
                   query: args.query,
@@ -375,6 +431,122 @@ ${threadText || "(Not run in a thread)"}`;
               tool_call_id: toolCall.id,
               name: "search_messages",
               content: JSON.stringify(searchResults),
+            });
+          } else if (toolCall.function.name === "lookup_user") {
+            let args;
+            try {
+              args = JSON.parse(toolCall.function.arguments);
+            } catch (err) {
+              args = { name: toolCall.function.arguments };
+            }
+
+            const needle = (args.name || "").toLowerCase().replace(/^@/, "").trim();
+            let result;
+            try {
+              const matches = [];
+              // Register a candidate and pre-build a clickable, non-pinging
+              // profile link so any "<@name>" the model later writes resolves
+              // to a real link. Prefer the Slack-provided permalink; fall back
+              // to a team-scoped client link.
+              const register = (userId, handle, display, permalink, title) => {
+                const name = display || handle || "user";
+                matches.push({
+                  user_id: userId || null,
+                  handle: handle || null,
+                  display_name: name,
+                  title: title || undefined,
+                });
+                const url =
+                  permalink ||
+                  (userId && TEAM_ID ? `https://app.slack.com/client/${TEAM_ID}/${userId}` : null);
+                if (url) {
+                  const link = `<${url}|@${name}>`;
+                  for (const n of [handle, display]) {
+                    if (n) authorLinks[n.toLowerCase()] = link;
+                  }
+                }
+              };
+
+              if (actionToken) {
+                // PREFERRED: relevance-ranked user search via the AI-app method.
+                // No org-wide pagination, no rate-limit blowups. Uses the
+                // search:read.users scope. User objects expose user_id,
+                // full_name, title and permalink (no @handle), so author
+                // filtering must use the user_id, not a handle.
+                const sr = await slackClient.apiCall("assistant.search.context", {
+                  query: args.name,
+                  action_token: actionToken,
+                  content_types: "users",
+                });
+                const users = (sr.results && sr.results.users) || [];
+                for (const u of users.slice(0, 10)) {
+                  register(
+                    u.user_id,
+                    u.username || u.name || null,
+                    u.full_name || u.display_name || u.real_name,
+                    u.permalink,
+                    u.title
+                  );
+                }
+              } else {
+                // FALLBACK (no action_token): bounded users.list scan. Hard page
+                // cap so a large workspace can't trigger a rate-limit storm; stop
+                // on the first exact handle/name match.
+                const MAX_PAGES = 6;
+                let cursor;
+                let exact = false;
+                let pages = 0;
+                do {
+                  const res = await slackClient.users.list({ limit: 200, cursor });
+                  for (const u of res.members || []) {
+                    if (u.deleted || u.is_bot) continue;
+                    const p = u.profile || {};
+                    const display = p.display_name || p.real_name || u.name;
+                    const fields = [u.name, p.display_name, p.display_name_normalized, p.real_name, p.real_name_normalized]
+                      .filter(Boolean)
+                      .map((s) => s.toLowerCase());
+                    if (fields.some((f) => f === needle)) {
+                      register(u.id, u.name, display);
+                      exact = true;
+                      break;
+                    }
+                    if (fields.some((f) => f.includes(needle)) && matches.length < 10) {
+                      register(u.id, u.name, display);
+                    }
+                  }
+                  cursor = res.response_metadata && res.response_metadata.next_cursor;
+                  pages++;
+                } while (cursor && !exact && pages < MAX_PAGES);
+              }
+
+              if (matches.length === 0) {
+                result = {
+                  info: `No user match found for "${args.name}".`,
+                };
+              } else {
+                const top = matches[0];
+                // Author filtering is by user ID: search.messages honors the
+                // encoded mention form from:<@U123>. Prefer it over a handle.
+                const fromOperator = top.user_id ? `from:<@${top.user_id}>` : `from:@${top.handle || needle}`;
+                result = {
+                  matches,
+                  hint: `For an author-scoped search, add "${fromOperator}" to your search_messages query, e.g. "cheese ${fromOperator}". Use the FIRST match unless the title indicates a different person.`,
+                };
+              }
+            } catch (err) {
+              console.error("lookup_user failed:", err);
+              if (err.code === "slack_webapi_platform_error" && err.data && err.data.error === "missing_scope") {
+                result = { error: "The bot is missing the 'users:read' scope required to look up users. Add 'users:read' in the Slack app settings and reinstall the app." };
+              } else {
+                result = { error: `Failed to look up user: ${err.message}` };
+              }
+            }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              name: "lookup_user",
+              content: JSON.stringify(result),
             });
           } else if (toolCall.function.name === "search_channel_history") {
             let args;
@@ -591,7 +763,7 @@ ${threadText || "(Not run in a thread)"}`;
     answerText = `Error calling Gemini API: ${error.message}`;
   }
 
-  const formattedAnswerText = convertMarkdownToMrkdwn(answerText);
+  const formattedAnswerText = convertMarkdownToMrkdwn(answerText, authorLinks);
 
   // Count this as a question answered (any early return above skips this).
   const total = recordAnswer();
